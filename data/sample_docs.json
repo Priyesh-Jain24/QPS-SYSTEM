@@ -1,0 +1,27 @@
+[
+  {
+    "id": "extra-doc-1",
+    "title": "What is BM25?",
+    "content": "BM25 is a ranking function used by search engines to estimate the relevance of documents to a given query, based on term frequency and document length normalization."
+  },
+  {
+    "id": "extra-doc-2",
+    "title": "Vector Embeddings for Semantic Search",
+    "content": "Vector embeddings represent text as points in a high-dimensional space, allowing similarity search based on meaning rather than exact keyword matches."
+  },
+  {
+    "id": "extra-doc-3",
+    "title": "Consistent Hashing for Sharding",
+    "content": "Consistent hashing is a technique used to distribute data across shards in a way that minimizes reshuffling when nodes are added or removed."
+  },
+  {
+    "id": "extra-doc-4",
+    "title": "Concurrency Patterns in Go",
+    "content": "Go's goroutines and channels make it straightforward to express concurrent fan-out and fan-in patterns, which are core to distributed query coordination."
+  },
+  {
+    "id": "extra-doc-5",
+    "title": "Fault Tolerance in Distributed Systems",
+    "content": "Fault-tolerant systems continue operating correctly even when some components fail, often by using timeouts, retries, replication, and health checks."
+  }
+]

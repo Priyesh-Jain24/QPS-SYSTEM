@@ -1,0 +1,67 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.12
+    command:
+      - /usr/local/bin/etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://0.0.0.0:2379
+    ports:
+      - "2379:2379"
+
+  shard1:
+    build: ./shard
+    environment:
+      SHARD_ID: shard1
+      SHARD_ADDR: shard1:8081
+      PORT: "8081"
+      ETCD_ENDPOINTS: "etcd:2379"
+    ports:
+      - "8081:8081"
+    depends_on:
+      - etcd
+
+  shard2:
+    build: ./shard
+    environment:
+      SHARD_ID: shard2
+      SHARD_ADDR: shard2:8081
+      PORT: "8081"
+      ETCD_ENDPOINTS: "etcd:2379"
+    ports:
+      - "8082:8081"
+    depends_on:
+      - etcd
+
+  shard3:
+    build: ./shard
+    environment:
+      SHARD_ID: shard3
+      SHARD_ADDR: shard3:8081
+      PORT: "8081"
+      ETCD_ENDPOINTS: "etcd:2379"
+    ports:
+      - "8083:8081"
+    depends_on:
+      - etcd
+
+  coordinator:
+    build: ./coordinator
+    environment:
+      PORT: "8080"
+      SHARD_ADDRS: "http://shard1:8081,http://shard2:8081,http://shard3:8081"
+      REDIS_ADDR: "redis:6379"
+      ETCD_ENDPOINTS: "etcd:2379"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+      - etcd
+      - shard1
+      - shard2
+      - shard3
