@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -35,6 +36,13 @@ func (r *ShardRegistry) List() []ShardInfo {
 	return out
 }
 
+// Count returns the number of currently registered shards.
+func (r *ShardRegistry) Count() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.shards)
+}
+
 func (r *ShardRegistry) Watch(ctx context.Context, cli *clientv3.Client) error {
 	resp, err := cli.Get(ctx, "/shards/", clientv3.WithPrefix())
 	if err != nil {
@@ -50,9 +58,37 @@ func (r *ShardRegistry) Watch(ctx context.Context, cli *clientv3.Client) error {
 	}
 	r.mu.Unlock()
 
-	watchCh := cli.Watch(ctx, "/shards/", clientv3.WithPrefix(), clientv3.WithRev(resp.Header.Revision+1))
-	go func() {
+	go r.watchLoop(ctx, cli, resp.Header.Revision+1)
+	return nil
+}
+
+// watchLoop continuously watches etcd for shard changes. On errors or
+// channel closures it reconnects with exponential backoff (1s → 2s → 4s,
+// capped at 30s) rather than silently dying.
+func (r *ShardRegistry) watchLoop(ctx context.Context, cli *clientv3.Client, startRev int64) {
+	backoff := 1 * time.Second
+	maxBackoff := 30 * time.Second
+	rev := startRev
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("shard watch stopped (context cancelled)")
+			return
+		default:
+		}
+
+		watchCh := cli.Watch(ctx, "/shards/", clientv3.WithPrefix(), clientv3.WithRev(rev))
+
 		for wresp := range watchCh {
+			if wresp.Err() != nil {
+				log.Printf("etcd watch error: %v, reconnecting in %v", wresp.Err(), backoff)
+				break
+			}
+
+			// Reset backoff on successful event.
+			backoff = 1 * time.Second
+
 			for _, ev := range wresp.Events {
 				key := string(ev.Kv.Key)
 				switch ev.Type {
@@ -70,8 +106,20 @@ func (r *ShardRegistry) Watch(ctx context.Context, cli *clientv3.Client) error {
 					r.mu.Unlock()
 					log.Printf("shard deregistered: %s", key)
 				}
+				rev = ev.Kv.ModRevision + 1
 			}
 		}
-	}()
-	return nil
+
+		// watchCh was closed — reconnect after backoff.
+		log.Printf("etcd watch channel closed, reconnecting in %v", backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
 }

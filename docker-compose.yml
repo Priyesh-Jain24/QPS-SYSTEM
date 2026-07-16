@@ -4,6 +4,11 @@ services:
     ports:
       - "6379:6379"
 
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+
   etcd:
     image: quay.io/coreos/etcd:v3.5.12
     command:
@@ -21,10 +26,12 @@ services:
       SHARD_ADDR: shard1:8081
       PORT: "8081"
       ETCD_ENDPOINTS: "etcd:2379"
+      OLLAMA_URL: "http://ollama:11434"
     ports:
       - "8081:8081"
     depends_on:
       - etcd
+      - ollama
 
   shard2:
     build: ./shard
@@ -33,10 +40,12 @@ services:
       SHARD_ADDR: shard2:8081
       PORT: "8081"
       ETCD_ENDPOINTS: "etcd:2379"
+      OLLAMA_URL: "http://ollama:11434"
     ports:
       - "8082:8081"
     depends_on:
       - etcd
+      - ollama
 
   shard3:
     build: ./shard
@@ -45,23 +54,26 @@ services:
       SHARD_ADDR: shard3:8081
       PORT: "8081"
       ETCD_ENDPOINTS: "etcd:2379"
+      OLLAMA_URL: "http://ollama:11434"
     ports:
       - "8083:8081"
     depends_on:
       - etcd
+      - ollama
 
   coordinator:
     build: ./coordinator
     environment:
       PORT: "8080"
-      SHARD_ADDRS: "http://shard1:8081,http://shard2:8081,http://shard3:8081"
       REDIS_ADDR: "redis:6379"
       ETCD_ENDPOINTS: "etcd:2379"
+      OLLAMA_URL: "http://ollama:11434"
     ports:
       - "8080:8080"
     depends_on:
       - redis
       - etcd
+      - ollama
       - shard1
       - shard2
       - shard3

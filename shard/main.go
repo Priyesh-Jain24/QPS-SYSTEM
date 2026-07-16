@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,9 +18,10 @@ import (
 
 // SearchResult is a single ranked match returned by this shard.
 type SearchResult struct {
-	ID    string  `json:"id"`
-	Title string  `json:"title"`
-	Score float64 `json:"score"`
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	Score     float64   `json:"score"`
+	Embedding []float64 `json:"embedding,omitempty"`
 }
 
 // SearchResponse is the full payload returned from /search.
@@ -32,8 +34,9 @@ type SearchResponse struct {
 }
 
 var (
-	index   bleve.Index
-	shardID string
+	index         bleve.Index
+	shardID       string
+	docEmbeddings sync.Map // ID -> []float64 mapping for faster indexing integration
 )
 
 func buildIndex(docs []Document) (bleve.Index, error) {
@@ -76,10 +79,15 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		if t, ok := hit.Fields["title"].(string); ok {
 			title = t
 		}
+		var emb []float64
+		if val, ok := docEmbeddings.Load(hit.ID); ok {
+			emb = val.([]float64)
+		}
 		results = append(results, SearchResult{
-			ID:    hit.ID,
-			Title: title,
-			Score: hit.Score,
+			ID:        hit.ID,
+			Title:     title,
+			Score:     hit.Score,
+			Embedding: emb,
 		})
 	}
 
@@ -110,12 +118,23 @@ func getenv(key, fallback string) string {
 }
 
 func main() {
+	shardStartTime = time.Now()
 	shardID = getenv("SHARD_ID", "shard1")
+	ollamaURL = getenv("OLLAMA_URL", "")
 	port := getenv("PORT", "8081")
 	shardAddr := getenv("SHARD_ADDR", "localhost:"+port) // must be reachable from coordinator, e.g. "shard1:8081"
 	etcdEndpoints := getenv("ETCD_ENDPOINTS", "etcd:2379")
 
 	docs := seedDocuments(shardID)
+	// Compute embeddings for seed documents on startup in the background.
+	// This ensures startup doesn't hang if Ollama is still pulling the model.
+	go func() {
+		for _, d := range docs {
+			if emb, err := getEmbedding(d.Title + " " + d.Content); err == nil && len(emb) > 0 {
+				docEmbeddings.Store(d.ID, emb)
+			}
+		}
+	}()
 
 	idx, err := buildIndex(docs)
 	if err != nil {
@@ -125,6 +144,8 @@ func main() {
 
 	http.HandleFunc("/search", searchHandler)
 	http.HandleFunc("/health", healthHandler)
+	http.HandleFunc("/index", ingestHandler)
+	http.HandleFunc("/stats", statsHandler)
 
 	srv := &http.Server{Addr: ":" + port}
 
