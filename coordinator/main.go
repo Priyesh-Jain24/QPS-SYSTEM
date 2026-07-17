@@ -28,21 +28,27 @@ type ShardResult struct {
 	ShardID string `json:"shard_id"`
 	Query   string `json:"query"`
 	Results []struct {
-		ID        string    `json:"id"`
-		Title     string    `json:"title"`
-		Score     float64   `json:"score"`
-		Embedding []float64 `json:"embedding,omitempty"`
+		ID         string            `json:"id"`
+		Title      string            `json:"title"`
+		Content    string            `json:"content,omitempty"`
+		Score      float64           `json:"score"`
+		Embedding  []float64         `json:"embedding,omitempty"`
+		Highlights map[string]string `json:"highlights,omitempty"`
+		Metadata   map[string]string `json:"metadata,omitempty"`
 	} `json:"results"`
 	TookMs int64 `json:"took_ms"`
 }
 
 // MergedResult is a single ranked hit in the coordinator's final response.
 type MergedResult struct {
-	ID        string    `json:"id"`
-	Title     string    `json:"title"`
-	Score     float64   `json:"score"`
-	ShardID   string    `json:"shard_id"`
-	Embedding []float64 `json:"-"` // Used internally by reranker, not returned to client
+	ID         string            `json:"id"`
+	Title      string            `json:"title"`
+	Content    string            `json:"content,omitempty"`
+	Score      float64           `json:"score"`
+	ShardID    string            `json:"shard_id"`
+	Highlights map[string]string `json:"highlights,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	Embedding  []float64         `json:"-"` // Used internally by reranker, not returned to client
 }
 
 // CoordinatorResponse is the final payload returned to the client.
@@ -83,6 +89,11 @@ var (
 
 	// Consistent hash ring for document routing.
 	hashRing *HashRing
+
+	// Circuit breaker for shard communication.
+	circuitBrk *CircuitBreaker
+
+	internalSecret string
 )
 
 func getenv(key, fallback string) string {
@@ -96,10 +107,20 @@ func getenv(key, fallback string) string {
 // Errors and timeouts are returned to the caller rather than swallowed, so
 // the fan-out logic can decide whether to treat a missing shard as fatal
 // or return partial results.
-func queryShard(ctx context.Context, addr, query string) (*ShardResult, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, addr+"/search?q="+url.QueryEscape(query), nil)
+func queryShard(ctx context.Context, addr, query string, extraParams url.Values) (*ShardResult, error) {
+	params := url.Values{}
+	params.Set("q", query)
+	for k, v := range extraParams {
+		for _, val := range v {
+			params.Set(k, val)
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, addr+"/search?"+params.Encode(), nil)
 	if err != nil {
 		return nil, err
+	}
+	if internalSecret != "" {
+		req.Header.Set("X-Internal-Secret", internalSecret)
 	}
 
 	resp, err := shardClient.Do(req)
@@ -118,7 +139,7 @@ func queryShard(ctx context.Context, addr, query string) (*ShardResult, error) {
 // fanOut queries all known shards concurrently and returns whatever
 // results come back within the timeout. Slow or dead shards are skipped
 // rather than failing the whole query (partial results > no results).
-func fanOut(query string) ([]MergedResult, []string) {
+func fanOut(query string, extraParams url.Values) ([]MergedResult, []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), shardTimeout)
 	defer cancel()
 
@@ -140,10 +161,23 @@ func fanOut(query string) ([]MergedResult, []string) {
 		go func(s ShardInfo) {
 			defer wg.Done()
 
-			result, err := queryShard(ctx, "http://"+s.Addr, query)
+			// Circuit breaker: skip shard if its circuit is open.
+			if circuitBrk != nil && !circuitBrk.AllowRequest(s.Addr) {
+				log.Printf("shard %s (%s) skipped: circuit open", s.ID, s.Addr)
+				return
+			}
+
+			result, err := queryShard(ctx, "http://"+s.Addr, query, extraParams)
 			if err != nil {
+				if circuitBrk != nil {
+					circuitBrk.RecordFailure(s.Addr)
+				}
 				log.Printf("shard %s (%s) failed or timed out: %v", s.ID, s.Addr, err)
 				return
+			}
+
+			if circuitBrk != nil {
+				circuitBrk.RecordSuccess(s.Addr)
 			}
 
 			mu.Lock()
@@ -151,11 +185,14 @@ func fanOut(query string) ([]MergedResult, []string) {
 			shardsUsed = append(shardsUsed, result.ShardID)
 			for _, r := range result.Results {
 				merged = append(merged, MergedResult{
-					ID:        r.ID,
-					Title:     r.Title,
-					Score:     r.Score,
-					ShardID:   result.ShardID,
-					Embedding: r.Embedding,
+					ID:         r.ID,
+					Title:      r.Title,
+					Content:    r.Content,
+					Score:      r.Score,
+					ShardID:    result.ShardID,
+					Highlights: r.Highlights,
+					Embedding:  r.Embedding,
+					Metadata:   r.Metadata,
 				})
 			}
 		}(s)
@@ -257,7 +294,25 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("cache MISS for %q (total misses: %d)", query, misses)
 	}
 
-	merged, shardsUsed := fanOut(query)
+	// Build extra params from the request to pass through to shards.
+	extraParams := url.Values{}
+	if field := r.URL.Query().Get("field"); field != "" {
+		extraParams.Set("field", field)
+	}
+	if mode := r.URL.Query().Get("mode"); mode != "" {
+		extraParams.Set("mode", mode)
+	}
+	if r.URL.Query().Get("highlight") == "true" {
+		extraParams.Set("highlight", "true")
+	}
+
+	for k, v := range r.URL.Query() {
+		if strings.HasPrefix(k, "filter_") && len(v) > 0 {
+			extraParams.Set(k, v[0])
+		}
+	}
+
+	merged, shardsUsed := fanOut(query, extraParams)
 	merged = Rerank(query, merged)
 	totalResults := len(merged)
 
@@ -294,6 +349,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	trackQuery(query, totalResults, resp.TookMs)
 	writeJSON(w, resp)
 }
 
@@ -329,6 +385,11 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		code = http.StatusOK // still respond 200 but flag as degraded
 	}
 
+	var circuitStatus map[string]string
+	if circuitBrk != nil {
+		circuitStatus = circuitBrk.Status()
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -339,6 +400,9 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 		"uptime_seconds":   int64(time.Since(startTime).Seconds()),
 		"cache_hits":       atomic.LoadInt64(&cacheHits),
 		"cache_misses":     atomic.LoadInt64(&cacheMisses),
+		"total_requests":   atomic.LoadInt64(&metricsTotalRequests),
+		"active_requests":  atomic.LoadInt64(&metricsActiveRequests),
+		"circuit_breakers": circuitStatus,
 	})
 }
 
@@ -452,6 +516,9 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if internalSecret != "" {
+		req.Header.Set("X-Internal-Secret", internalSecret)
+	}
 
 	resp, err := shardClient.Do(req)
 	if err != nil {
@@ -466,6 +533,250 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 
 	log.Printf("document %q routed to shard %s", doc.ID, targetAddr)
+
+	// Invalidate search cache since a new document could affect results.
+	invalidateCache(r.Context())
+}
+
+// invalidateCache flushes all search cache entries. Called on any mutation
+// (index, delete) since any change could affect cached search results.
+func invalidateCache(ctx context.Context) {
+	if rdb == nil {
+		return
+	}
+	var cursor uint64
+	for {
+		keys, nextCursor, err := rdb.Scan(ctx, cursor, "searchsphere:query:*", 100).Result()
+		if err != nil {
+			log.Printf("cache invalidation scan failed: %v", err)
+			return
+		}
+		if len(keys) > 0 {
+			rdb.Del(ctx, keys...)
+		}
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
+	log.Println("cache invalidated after mutation")
+}
+
+// deleteDocHandler routes a document deletion to the correct shard via hash ring.
+//
+//	DELETE /documents/{id}
+func deleteDocHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	docID := strings.TrimPrefix(r.URL.Path, "/documents/")
+	if docID == "" {
+		http.Error(w, "document ID is required in path", http.StatusBadRequest)
+		return
+	}
+
+	hashRing.Update(shardRegistry.List())
+	targetAddr := hashRing.GetShard(docID)
+	if targetAddr == "" {
+		http.Error(w, "no shards available", http.StatusServiceUnavailable)
+		return
+	}
+
+	shardURL := "http://" + targetAddr + "/documents/" + url.PathEscape(docID)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodDelete, shardURL, nil)
+	if err != nil {
+		http.Error(w, "failed to create request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if internalSecret != "" {
+		req.Header.Set("X-Internal-Secret", internalSecret)
+	}
+
+	resp, err := shardClient.Do(req)
+	if err != nil {
+		http.Error(w, "shard request failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+
+	if resp.StatusCode < 300 {
+		invalidateCache(r.Context())
+	}
+	log.Printf("document %q delete routed to shard %s", docID, targetAddr)
+}
+
+// getDocHandler routes a document retrieval to the correct shard via hash ring.
+//
+//	GET /documents/{id}
+func getDocHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	docID := strings.TrimPrefix(r.URL.Path, "/documents/")
+	if docID == "" {
+		http.Error(w, "document ID is required in path", http.StatusBadRequest)
+		return
+	}
+
+	hashRing.Update(shardRegistry.List())
+	targetAddr := hashRing.GetShard(docID)
+	if targetAddr == "" {
+		http.Error(w, "no shards available", http.StatusServiceUnavailable)
+		return
+	}
+
+	shardURL := "http://" + targetAddr + "/documents/" + url.PathEscape(docID)
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, shardURL, nil)
+	if err != nil {
+		http.Error(w, "failed to create request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if internalSecret != "" {
+		req.Header.Set("X-Internal-Secret", internalSecret)
+	}
+
+	resp, err := shardClient.Do(req)
+	if err != nil {
+		http.Error(w, "shard request failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// BulkRequest is the payload for coordinator-level bulk indexing.
+type BulkRequest struct {
+	Documents []struct {
+		ID      string `json:"id"`
+		Title   string `json:"title"`
+		Content string `json:"content"`
+	} `json:"documents"`
+}
+
+// bulkIndexHandler splits a batch of documents by hash ring and fans out
+// to each shard's /bulk endpoint concurrently.
+//
+//	POST /bulk
+func bulkIndexHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+	if err != nil {
+		http.Error(w, "failed to read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	var req BulkRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Documents) == 0 {
+		http.Error(w, "'documents' array is required", http.StatusBadRequest)
+		return
+	}
+
+	hashRing.Update(shardRegistry.List())
+
+	// Group documents by target shard.
+	shardBatches := make(map[string][]json.RawMessage)
+	for _, doc := range req.Documents {
+		if doc.ID == "" {
+			continue
+		}
+		targetAddr := hashRing.GetShard(doc.ID)
+		if targetAddr == "" {
+			continue
+		}
+		data, _ := json.Marshal(doc)
+		shardBatches[targetAddr] = append(shardBatches[targetAddr], data)
+	}
+
+	type shardBulkResult struct {
+		ShardAddr string   `json:"shard_addr"`
+		Count     int      `json:"count"`
+		Errors    []string `json:"errors,omitempty"`
+	}
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		results []shardBulkResult
+		total   int
+	)
+
+	for addr, docs := range shardBatches {
+		wg.Add(1)
+		go func(addr string, docs []json.RawMessage) {
+			defer wg.Done()
+
+			payload, _ := json.Marshal(map[string]interface{}{
+				"documents": docs,
+			})
+
+			shardURL := "http://" + addr + "/bulk"
+			req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, shardURL, bytes.NewReader(payload))
+			if err != nil {
+				mu.Lock()
+				results = append(results, shardBulkResult{ShardAddr: addr, Errors: []string{err.Error()}})
+				mu.Unlock()
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if internalSecret != "" {
+				req.Header.Set("X-Internal-Secret", internalSecret)
+			}
+
+			resp, err := shardClient.Do(req)
+			if err != nil {
+				mu.Lock()
+				results = append(results, shardBulkResult{ShardAddr: addr, Errors: []string{err.Error()}})
+				mu.Unlock()
+				return
+			}
+			defer resp.Body.Close()
+
+			var sr struct {
+				Count  int      `json:"count"`
+				Errors []string `json:"errors"`
+			}
+			json.NewDecoder(resp.Body).Decode(&sr)
+
+			mu.Lock()
+			total += sr.Count
+			results = append(results, shardBulkResult{ShardAddr: addr, Count: sr.Count, Errors: sr.Errors})
+			mu.Unlock()
+		}(addr, docs)
+	}
+
+	wg.Wait()
+
+	invalidateCache(r.Context())
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":        "indexed",
+		"total_count":   total,
+		"shard_results": results,
+	})
+	log.Printf("bulk indexed %d documents across %d shards", total, len(shardBatches))
 }
 
 // corsMiddleware wraps a handler to add permissive CORS headers so
@@ -489,6 +800,17 @@ func main() {
 	hashRing = NewHashRing(150) // 150 virtual nodes per shard for even distribution
 	ollamaURL = getenv("OLLAMA_URL", "")
 	etcdEndpoints := getenv("ETCD_ENDPOINTS", "etcd:2379")
+
+	// Initialize middleware subsystems.
+	initAuth()
+	initRateLimiter()
+	circuitBrk = NewCircuitBreaker()
+	internalSecret = os.Getenv("INTERNAL_SECRET")
+	if internalSecret != "" {
+		log.Printf("internal cluster authentication enabled")
+	} else {
+		log.Printf("WARNING: INTERNAL_SECRET not set - shard traffic is unauthenticated")
+	}
 
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   strings.Split(etcdEndpoints, ","),
@@ -519,10 +841,27 @@ func main() {
 
 	port := getenv("PORT", "8080")
 
-	http.HandleFunc("/search", corsMiddleware(searchHandler))
-	http.HandleFunc("/health", corsMiddleware(healthHandler))
-	http.HandleFunc("/cache", corsMiddleware(cacheHandler))
-	http.HandleFunc("/index", corsMiddleware(indexHandler))
+	// All routes go through: logging → rate limit → metrics → CORS → handler
+	http.HandleFunc("/search", wrapMiddleware(searchHandler))
+	http.HandleFunc("/health", wrapMiddleware(healthHandler))
+	http.HandleFunc("/cache", wrapMiddleware(cacheHandler))
+	http.HandleFunc("/index", wrapAdminMiddleware(indexHandler))
+	http.HandleFunc("/bulk", wrapAdminMiddleware(bulkIndexHandler))
+	http.HandleFunc("/metrics", wrapMiddleware(metricsHandler))
+	http.HandleFunc("/suggest", wrapMiddleware(suggestHandler))
+	http.HandleFunc("/analytics", wrapMiddleware(analyticsHandler))
+	http.HandleFunc("/documents/", wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getDocHandler(w, r)
+		case http.MethodDelete:
+			deleteDocHandler(w, r)
+		case http.MethodOptions:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
+	}))
 
 	srv := &http.Server{Addr: ":" + port}
 

@@ -2,9 +2,10 @@ package main
 
 // Document is the unit indexed and returned by a shard.
 type Document struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Content string `json:"content"`
+	ID       string            `json:"id"`
+	Title    string            `json:"title"`
+	Content  string            `json:"content"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // seedDocuments returns a small set of sample documents so each shard has

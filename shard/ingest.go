@@ -5,20 +5,26 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/blevesearch/bleve/v2"
 )
 
 var (
 	shardStartTime time.Time
 	docsIngested   int64
+	docsDeleted    int64
 )
 
 // IngestRequest is the payload accepted by POST /index.
 type IngestRequest struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Content string `json:"content"`
+	ID       string            `json:"id"`
+	Title    string            `json:"title"`
+	Content  string            `json:"content"`
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // IngestResponse is the payload returned after indexing a document.
@@ -28,11 +34,25 @@ type IngestResponse struct {
 	DocID   string `json:"doc_id"`
 }
 
+// BulkIngestRequest is the payload accepted by POST /bulk.
+type BulkIngestRequest struct {
+	Documents []IngestRequest `json:"documents"`
+}
+
+// BulkIngestResponse is the payload returned after bulk indexing.
+type BulkIngestResponse struct {
+	Status  string   `json:"status"`
+	ShardID string   `json:"shard_id"`
+	Count   int      `json:"count"`
+	Errors  []string `json:"errors,omitempty"`
+}
+
 // StatsResponse is the payload returned by GET /stats.
 type StatsResponse struct {
 	ShardID      string `json:"shard_id"`
 	DocCount     int    `json:"doc_count"`
 	DocsIngested int64  `json:"docs_ingested"`
+	DocsDeleted  int64  `json:"docs_deleted"`
 	UptimeSecs   int64  `json:"uptime_seconds"`
 }
 
@@ -69,9 +89,10 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	doc := Document{
-		ID:      req.ID,
-		Title:   req.Title,
-		Content: req.Content,
+		ID:       req.ID,
+		Title:    req.Title,
+		Content:  req.Content,
+		Metadata: req.Metadata,
 	}
 
 	if err := index.Index(doc.ID, doc); err != nil {
@@ -95,6 +116,178 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// deleteHandler removes a document from the Bleve index and embedding cache.
+//
+//	DELETE /documents/{id}
+func deleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract ID from path: /documents/{id}
+	docID := strings.TrimPrefix(r.URL.Path, "/documents/")
+	if docID == "" {
+		http.Error(w, "document ID is required in path", http.StatusBadRequest)
+		return
+	}
+
+	// Check if the document exists first.
+	bleveDoc, err := index.Document(docID)
+	if err != nil || bleveDoc == nil {
+		http.Error(w, "document not found", http.StatusNotFound)
+		return
+	}
+
+	if err := index.Delete(docID); err != nil {
+		http.Error(w, "delete failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	docEmbeddings.Delete(docID)
+	atomic.AddInt64(&docsDeleted, 1)
+	log.Printf("[%s] deleted document %q", shardID, docID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":   "deleted",
+		"shard_id": shardID,
+		"doc_id":   docID,
+	})
+}
+
+// getDocumentHandler retrieves a single document by ID from the Bleve index.
+//
+//	GET /documents/{id}
+func getDocumentHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	docID := strings.TrimPrefix(r.URL.Path, "/documents/")
+	if docID == "" {
+		http.Error(w, "document ID is required in path", http.StatusBadRequest)
+		return
+	}
+
+	// Use a DocID query for exact ID lookup to reconstruct stored fields.
+	q := bleve.NewDocIDQuery([]string{docID})
+	searchReq := bleve.NewSearchRequest(q)
+	searchReq.Size = 1
+	searchReq.Fields = []string{"title", "content"}
+
+	res, err := index.Search(searchReq)
+	if err != nil {
+		http.Error(w, "lookup failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if res.Total == 0 {
+		http.Error(w, "document not found", http.StatusNotFound)
+		return
+	}
+
+	hit := res.Hits[0]
+	title, _ := hit.Fields["title"].(string)
+	content, _ := hit.Fields["content"].(string)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":       docID,
+		"title":    title,
+		"content":  content,
+		"shard_id": shardID,
+	})
+}
+
+// bulkIngestHandler accepts an array of documents and indexes them.
+//
+//	POST /bulk
+//	Body: {"documents": [{id, title, content}, ...]}
+func bulkIngestHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20)) // 10 MB limit for bulk
+	if err != nil {
+		http.Error(w, "failed to read body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	var req BulkIngestRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Documents) == 0 {
+		http.Error(w, "'documents' array is required and must not be empty", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		mu        sync.Mutex
+		errors    []string
+		indexed   int
+		wg        sync.WaitGroup
+		semaphore = make(chan struct{}, 5) // limit concurrency for embedding calls
+	)
+
+	for _, d := range req.Documents {
+		if d.ID == "" {
+			mu.Lock()
+			errors = append(errors, "skipped document with empty ID")
+			mu.Unlock()
+			continue
+		}
+
+		wg.Add(1)
+		go func(d IngestRequest) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			doc := Document{ID: d.ID, Title: d.Title, Content: d.Content, Metadata: d.Metadata}
+			if err := index.Index(doc.ID, doc); err != nil {
+				mu.Lock()
+				errors = append(errors, "failed to index "+doc.ID+": "+err.Error())
+				mu.Unlock()
+				return
+			}
+
+			if emb, err := getEmbedding(doc.Title + " " + doc.Content); err == nil && len(emb) > 0 {
+				docEmbeddings.Store(doc.ID, emb)
+			}
+
+			atomic.AddInt64(&docsIngested, 1)
+			mu.Lock()
+			indexed++
+			mu.Unlock()
+		}(d)
+	}
+
+	wg.Wait()
+	log.Printf("[%s] bulk indexed %d/%d documents", shardID, indexed, len(req.Documents))
+
+	status := http.StatusCreated
+	if len(errors) > 0 && indexed == 0 {
+		status = http.StatusInternalServerError
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(BulkIngestResponse{
+		Status:  "indexed",
+		ShardID: shardID,
+		Count:   indexed,
+		Errors:  errors,
+	})
+}
+
 // statsHandler returns runtime statistics for this shard.
 //
 //	GET /stats
@@ -111,6 +304,7 @@ func statsHandler(w http.ResponseWriter, r *http.Request) {
 		ShardID:      shardID,
 		DocCount:     int(docCount),
 		DocsIngested: atomic.LoadInt64(&docsIngested),
+		DocsDeleted:  atomic.LoadInt64(&docsDeleted),
 		UptimeSecs:   int64(time.Since(shardStartTime).Seconds()),
 	})
 }

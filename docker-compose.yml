@@ -27,8 +27,12 @@ services:
       PORT: "8081"
       ETCD_ENDPOINTS: "etcd:2379"
       OLLAMA_URL: "http://ollama:11434"
+      DATA_DIR: "/data"
+      INTERNAL_SECRET: "cluster-secret-key-12345"
     ports:
       - "8081:8081"
+    volumes:
+      - ./data/shard1:/data
     depends_on:
       - etcd
       - ollama
@@ -41,8 +45,12 @@ services:
       PORT: "8081"
       ETCD_ENDPOINTS: "etcd:2379"
       OLLAMA_URL: "http://ollama:11434"
+      DATA_DIR: "/data"
+      INTERNAL_SECRET: "cluster-secret-key-12345"
     ports:
       - "8082:8081"
+    volumes:
+      - ./data/shard2:/data
     depends_on:
       - etcd
       - ollama
@@ -55,8 +63,12 @@ services:
       PORT: "8081"
       ETCD_ENDPOINTS: "etcd:2379"
       OLLAMA_URL: "http://ollama:11434"
+      DATA_DIR: "/data"
+      INTERNAL_SECRET: "cluster-secret-key-12345"
     ports:
       - "8083:8081"
+    volumes:
+      - ./data/shard3:/data
     depends_on:
       - etcd
       - ollama
@@ -68,6 +80,8 @@ services:
       REDIS_ADDR: "redis:6379"
       ETCD_ENDPOINTS: "etcd:2379"
       OLLAMA_URL: "http://ollama:11434"
+      API_KEY: "supersecret-admin-key"
+      INTERNAL_SECRET: "cluster-secret-key-12345"
     ports:
       - "8080:8080"
     depends_on:
