@@ -863,6 +863,8 @@ func main() {
 		}
 	}))
 
+	http.Handle("/", http.FileServer(http.Dir("./frontend/dist")))
+
 	srv := &http.Server{Addr: ":" + port}
 
 	// Start serving in background.

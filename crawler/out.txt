@@ -1,0 +1,8 @@
+2026/07/19 22:06:50 Starting crawler with 3 workers, limit=15.
+2026/07/19 22:06:50 Searching Wikipedia for topic: '"'...
+2026/07/19 22:06:50 [W1] Crawling 1/15: https://en.wikipedia.org/wiki/%22
+2026/07/19 22:06:50 [W2] Crawling 2/15: https://en.wikipedia.org/wiki/%22Weird_Al%22_Yankovic
+2026/07/19 22:06:50 [W3] Crawling 3/15: https://en.wikipedia.org/wiki/-stan
+2026/07/19 22:06:50 [W1] Crawling 4/15: https://en.wikipedia.org/wiki/%22Heroes%22_(album)
+2026/07/19 22:06:50 [W2] Crawling 5/15: https://en.wikipedia.org/wiki/%22Heroes%22_(David_Bowie_song)
+2026/07/19 22:06:50 Crawler finished gracefully.
