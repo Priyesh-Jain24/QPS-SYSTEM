@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: 'searchsphere-coordinator'
+    static_configs:
+      - targets: ['coordinator:8080']
+  
+  - job_name: 'searchsphere-shards'
+    static_configs:
+      - targets: ['shard1:8081', 'shard2:8081', 'shard3:8081']

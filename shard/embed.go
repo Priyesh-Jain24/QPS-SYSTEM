@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -32,7 +34,7 @@ func getEmbedding(text string) ([]float64, error) {
 		Prompt: text,
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ollamaURL+"/api/embeddings", bytes.NewReader(reqBody))
@@ -57,4 +59,43 @@ func getEmbedding(text string) ([]float64, error) {
 		return nil, err
 	}
 	return ores.Embedding, nil
+}
+
+// Chunk represents a split portion of a document
+type Chunk struct {
+	ID     string
+	Text   string
+	Vector []float64
+}
+
+// getDocumentChunks chunks a document and returns the sub-documents.
+func getDocumentChunks(id, title, content string) ([]Chunk, error) {
+	words := strings.Fields(content)
+	chunkSize := 300 // typical fast embedding model context ceiling (words)
+	var rawChunks []string
+	if len(words) == 0 {
+		rawChunks = []string{content}
+	} else {
+		for i := 0; i < len(words); i += chunkSize {
+			end := i + chunkSize
+			if end > len(words) {
+				end = len(words)
+			}
+			rawChunks = append(rawChunks, strings.Join(words[i:end], " "))
+		}
+	}
+
+	var chunks []Chunk
+	for i, c := range rawChunks {
+		emb, err := getEmbedding(title + " " + c)
+		if err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, Chunk{
+			ID:     fmt.Sprintf("%s_chunk_%d", id, i),
+			Text:   c,
+			Vector: emb,
+		})
+	}
+	return chunks, nil
 }

@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: searchsphere-shard
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: searchsphere-shard
+  template:
+    metadata:
+      labels:
+        app: searchsphere-shard
+    spec:
+      containers:
+      - name: shard
+        image: searchsphere-shard:latest
+        imagePullPolicy: Never
+        env:
+        - name: SHARD_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: SHARD_ADDR
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        - name: PORT
+          value: "8081"
+        - name: ETCD_ENDPOINTS
+          value: "etcd:2379"
+        - name: OLLAMA_URL
+          value: "http://ollama:11434"
+        resources:
+          requests:
+            cpu: 200m
+          limits:
+            cpu: 1000m
+        volumeMounts:
+        - name: shard-data
+          mountPath: /data
+      volumes:
+      - name: shard-data
+        emptyDir: {}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: searchsphere-shard-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: searchsphere-shard
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 75

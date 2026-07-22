@@ -1,6 +1,9 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
@@ -34,15 +37,25 @@ func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, code: http.StatusOK}
 
-		next(sw, r)
+		reqID := r.Header.Get("X-Request-ID")
+		if reqID == "" {
+			b := make([]byte, 8)
+			rand.Read(b)
+			reqID = hex.EncodeToString(b)
+		}
+
+		ctx := context.WithValue(r.Context(), "request_id", reqID)
+		r = r.WithContext(ctx)
 
 		clientIP := r.RemoteAddr
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			clientIP = strings.Split(xff, ",")[0]
 		}
 
-		log.Printf("HTTP %s %s | %d | %dms | %s",
-			r.Method, r.URL.Path, sw.code,
+		next(sw, r)
+
+		log.Printf(`{"level":"info","request_id":"%s","method":"%s","path":"%s","status":%d,"latency_ms":%d,"client_ip":"%s"}`,
+			reqID, r.Method, r.URL.Path, sw.code,
 			time.Since(start).Milliseconds(), clientIP,
 		)
 	}

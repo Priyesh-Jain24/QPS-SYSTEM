@@ -1,0 +1,19 @@
+# Executables
+*.exe
+test-bin
+
+# Logs / temporary output
+*.log
+*.txt
+crawler/checkpoint.json
+
+# Search index / generated data
+data/
+*.gob
+
+# Environment
+.env
+
+# OS/editor
+.vscode/
+.DS_Store

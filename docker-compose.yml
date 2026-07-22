@@ -4,11 +4,6 @@ services:
     ports:
       - "6379:6379"
 
-  ollama:
-    image: ollama/ollama:latest
-    ports:
-      - "11434:11434"
-
   etcd:
     image: quay.io/coreos/etcd:v3.5.12
     command:
@@ -26,7 +21,7 @@ services:
       SHARD_ADDR: shard1:8081
       PORT: "8081"
       ETCD_ENDPOINTS: "etcd:2379"
-      OLLAMA_URL: "http://ollama:11434"
+      OLLAMA_URL: "http://host.docker.internal:11434"
       DATA_DIR: "/data"
       INTERNAL_SECRET: "cluster-secret-key-12345"
     ports:
@@ -35,7 +30,6 @@ services:
       - ./data/shard1:/data
     depends_on:
       - etcd
-      - ollama
 
   shard2:
     build: ./shard
@@ -44,7 +38,7 @@ services:
       SHARD_ADDR: shard2:8081
       PORT: "8081"
       ETCD_ENDPOINTS: "etcd:2379"
-      OLLAMA_URL: "http://ollama:11434"
+      OLLAMA_URL: "http://host.docker.internal:11434"
       DATA_DIR: "/data"
       INTERNAL_SECRET: "cluster-secret-key-12345"
     ports:
@@ -53,7 +47,6 @@ services:
       - ./data/shard2:/data
     depends_on:
       - etcd
-      - ollama
 
   shard3:
     build: ./shard
@@ -62,7 +55,7 @@ services:
       SHARD_ADDR: shard3:8081
       PORT: "8081"
       ETCD_ENDPOINTS: "etcd:2379"
-      OLLAMA_URL: "http://ollama:11434"
+      OLLAMA_URL: "http://host.docker.internal:11434"
       DATA_DIR: "/data"
       INTERNAL_SECRET: "cluster-secret-key-12345"
     ports:
@@ -71,15 +64,16 @@ services:
       - ./data/shard3:/data
     depends_on:
       - etcd
-      - ollama
 
   coordinator:
-    build: ./coordinator
+    build:
+      context: .
+      dockerfile: ./coordinator/Dockerfile
     environment:
       PORT: "8080"
       REDIS_ADDR: "redis:6379"
       ETCD_ENDPOINTS: "etcd:2379"
-      OLLAMA_URL: "http://ollama:11434"
+      OLLAMA_URL: "http://host.docker.internal:11434"
       API_KEY: "supersecret-admin-key"
       INTERNAL_SECRET: "cluster-secret-key-12345"
     ports:
@@ -87,7 +81,21 @@ services:
     depends_on:
       - redis
       - etcd
-      - ollama
+
       - shard1
       - shard2
       - shard3
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning

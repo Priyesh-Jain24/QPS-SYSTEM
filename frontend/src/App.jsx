@@ -79,10 +79,10 @@ function App() {
         setLoading(true);
         setError(null);
 
-        let pathUrl = `/search?q=${encodeURIComponent(searchStr)}`;
+        let pathUrl = `/search?q=${encodeURIComponent(searchStr)}&highlight=true`;
         if (searchStr.includes('?')) {
             const parts = searchStr.split('?');
-            pathUrl = `/search?q=${encodeURIComponent(parts[0].trim())}&${parts[1]}`;
+            pathUrl = `/search?q=${encodeURIComponent(parts[0].trim())}&highlight=true&${parts[1]}`;
         }
 
         try {
@@ -199,8 +199,8 @@ function App() {
 
                         return (
                             <div key={r.id} className="result-card">
-                                <h3>{title}</h3>
-                                <p>{content}</p>
+                                <h3 dangerouslySetInnerHTML={{ __html: title }}></h3>
+                                <p dangerouslySetInnerHTML={{ __html: content }}></p>
                                 <div className="result-meta">
                                     <span>ID: {r.id}</span>
                                     <span>Score: {r.score.toFixed(3)}</span>

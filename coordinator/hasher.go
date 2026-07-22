@@ -15,6 +15,7 @@ type HashRing struct {
 	replicas int            // virtual nodes per physical shard
 	keys     []int          // sorted hash values on the ring
 	ring     map[int]string // hash → shard address
+	shards   int            // number of physical shards
 }
 
 // NewHashRing creates a consistent hash ring with the given number of
@@ -39,6 +40,7 @@ func (h *HashRing) Update(shards []ShardInfo) {
 
 	h.keys = nil
 	h.ring = make(map[int]string, len(shards)*h.replicas)
+	h.shards = len(shards)
 
 	for _, s := range shards {
 		for i := 0; i < h.replicas; i++ {
@@ -69,4 +71,41 @@ func (h *HashRing) GetShard(docID string) string {
 	}
 
 	return h.ring[h.keys[idx]]
+}
+
+// GetShards returns a list of unique physical shard replica addresses.
+// It walks the consistent hash ring starting from the hash of the docID.
+func (h *HashRing) GetShards(docID string, count int) []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	if len(h.keys) == 0 {
+		return nil
+	}
+
+	hash := hashKey(docID)
+	idx := sort.SearchInts(h.keys, hash)
+
+	var targets []string
+	seen := make(map[string]bool)
+
+	for len(targets) < count {
+		if idx >= len(h.keys) {
+			idx = 0 // wrap around
+		}
+
+		addr := h.ring[h.keys[idx]]
+		if !seen[addr] {
+			seen[addr] = true
+			targets = append(targets, addr)
+		}
+
+		if len(seen) == h.shards {
+			break // Cannot return more unique shards than exist physically
+		}
+
+		idx++
+	}
+
+	return targets
 }

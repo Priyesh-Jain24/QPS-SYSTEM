@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -72,14 +74,14 @@ var (
 
 	// Dedicated HTTP client for shard communication with tight timeouts.
 	shardClient = &http.Client{
-		Timeout: 3 * time.Second,
+		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
 			MaxIdleConnsPerHost: 10,
 			IdleConnTimeout:     30 * time.Second,
 			DialContext: (&net.Dialer{
 				Timeout: 1 * time.Second,
 			}).DialContext,
-			ResponseHeaderTimeout: 2 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
 		},
 	}
 
@@ -121,6 +123,9 @@ func queryShard(ctx context.Context, addr, query string, extraParams url.Values)
 	}
 	if internalSecret != "" {
 		req.Header.Set("X-Internal-Secret", internalSecret)
+	}
+	if reqID, ok := ctx.Value("request_id").(string); ok && reqID != "" {
+		req.Header.Set("X-Request-ID", reqID)
 	}
 
 	resp, err := shardClient.Do(req)
@@ -259,6 +264,14 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	key := cacheKey(query)
 
+	// FIRE-AND-FORGET LEARNING:
+	// Always trigger a fast background crawl for the exact query term.
+	// If the user searches it, the engine should natively learn about it to improve future queries!
+	go func() {
+		// Only grab the top 2 articles for speed to avoid overwhelming the mesh
+		TriggerHybridCrawl(query, 2)
+	}()
+
 	// Try cache first.
 	if rdb != nil {
 		if cached, err := rdb.Get(ctx, key).Result(); err == nil {
@@ -314,6 +327,81 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 
 	merged, shardsUsed := fanOut(query, extraParams)
 	merged = Rerank(query, merged)
+
+	// RELEVANCE FILTER: Keep only results where the query appears as a whole word
+	// in the TITLE. Content bodies are too large and cause false positives
+	// (e.g., "steak" matching a Pizza article that mentions steak once).
+	queryLower := strings.ToLower(strings.TrimSpace(query))
+	wordPattern := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(queryLower) + `\b`)
+	filtered := make([]MergedResult, 0, len(merged))
+	for _, res := range merged {
+		if wordPattern.MatchString(res.Title) {
+			filtered = append(filtered, res)
+		}
+	}
+
+	// Fallback to content matching instantly before deciding to sleep
+	if len(filtered) == 0 {
+		for _, res := range merged {
+			if wordPattern.MatchString(res.Content) {
+				filtered = append(filtered, res)
+			}
+		}
+	}
+	merged = filtered
+
+	// WAIT FOR CRAWLER IF EMPTY: If no strong exact-word matches were naturally found,
+	// wait for the background crawler (which we just fired) to finish indexing!
+	if len(merged) == 0 {
+		log.Printf("Hybrid search triggered - no exact word match for: %s", query)
+		time.Sleep(2 * time.Second) // Give the background crawler a headstart to flush to Bleve
+
+		// Search again after crawling and indexing finishes
+		merged, shardsUsed = fanOut(query, extraParams)
+		merged = Rerank(query, merged)
+
+		filtered = make([]MergedResult, 0, len(merged))
+		for _, res := range merged {
+			if wordPattern.MatchString(res.Title) {
+				filtered = append(filtered, res)
+			}
+		}
+
+		// Fallback: if no title matches, accept content matches organically
+		if len(filtered) == 0 {
+			for _, res := range merged {
+				if wordPattern.MatchString(res.Content) {
+					filtered = append(filtered, res)
+				}
+			}
+		}
+		merged = filtered
+	}
+
+	// GROUP BY PARENT ID to deduplicate chunks belonging to the same document
+	grouped := make(map[string]*MergedResult)
+	var finalResults []MergedResult
+	for _, r := range merged {
+		parentID := r.ID
+		if p, ok := r.Metadata["parent_id"]; ok && p != "" {
+			parentID = p
+		}
+
+		if exist, ok := grouped[parentID]; ok {
+			if r.Score > exist.Score {
+				exist.Score = r.Score
+				exist.Content = r.Content
+				exist.Highlights = r.Highlights
+			}
+		} else {
+			copyR := r
+			copyR.ID = parentID
+			grouped[parentID] = &copyR
+			finalResults = append(finalResults, copyR)
+		}
+	}
+	merged = finalResults
+	sort.Slice(merged, func(i, j int) bool { return merged[i].Score > merged[j].Score })
 	totalResults := len(merged)
 
 	// Paginate results.
@@ -499,42 +587,66 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Rebuild hash ring from current shards.
+	// Rebuild hash ring
 	hashRing.Update(shardRegistry.List())
 
-	targetAddr := hashRing.GetShard(doc.ID)
-	if targetAddr == "" {
+	targetAddrs := hashRing.GetShards(doc.ID, 3) // Replication Factor = 3
+	if len(targetAddrs) == 0 {
 		http.Error(w, "no shards available for indexing", http.StatusServiceUnavailable)
 		return
 	}
 
-	// Forward to the target shard.
-	shardURL := "http://" + targetAddr + "/index"
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, shardURL, bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, "failed to create shard request: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if internalSecret != "" {
-		req.Header.Set("X-Internal-Secret", internalSecret)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var lastErr error
+	var successCount int
+
+	for _, addr := range targetAddrs {
+		wg.Add(1)
+		go func(target string) {
+			defer wg.Done()
+			shardURL := "http://" + target + "/index"
+			req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, shardURL, bytes.NewReader(body))
+			if err != nil {
+				return
+			}
+			req.Header.Set("Content-Type", "application/json")
+			if internalSecret != "" {
+				req.Header.Set("X-Internal-Secret", internalSecret)
+			}
+			if reqID, ok := r.Context().Value("request_id").(string); ok && reqID != "" {
+				req.Header.Set("X-Request-ID", reqID)
+			}
+
+			resp, err := shardClient.Do(req)
+			if err != nil {
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(addr)
 	}
 
-	resp, err := shardClient.Do(req)
-	if err != nil {
-		http.Error(w, "shard indexing request failed: "+err.Error(), http.StatusBadGateway)
+	wg.Wait()
+
+	if successCount == 0 {
+		http.Error(w, "shard indexing request failed: "+fmt.Sprint(lastErr), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
 
-	// Stream the shard's response back to the client.
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	w.WriteHeader(http.StatusCreated)
+	w.Write([]byte(`{"status":"indexed","replicas":` + strconv.Itoa(successCount) + `,"id":"` + doc.ID + `"}`))
 
-	log.Printf("document %q routed to shard %s", doc.ID, targetAddr)
-
-	// Invalidate search cache since a new document could affect results.
+	log.Printf("document %q replicated to %d shards", doc.ID, successCount)
 	invalidateCache(r.Context())
 }
 
@@ -578,37 +690,63 @@ func deleteDocHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hashRing.Update(shardRegistry.List())
-	targetAddr := hashRing.GetShard(docID)
-	if targetAddr == "" {
+	targetAddrs := hashRing.GetShards(docID, 3)
+	if len(targetAddrs) == 0 {
 		http.Error(w, "no shards available", http.StatusServiceUnavailable)
 		return
 	}
 
-	shardURL := "http://" + targetAddr + "/documents/" + url.PathEscape(docID)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodDelete, shardURL, nil)
-	if err != nil {
-		http.Error(w, "failed to create request: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if internalSecret != "" {
-		req.Header.Set("X-Internal-Secret", internalSecret)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var successCount int
+	var lastErr error
+
+	for _, targetAddr := range targetAddrs {
+		wg.Add(1)
+		go func(addr string) {
+			defer wg.Done()
+			shardURL := "http://" + addr + "/documents/" + url.PathEscape(docID)
+			req, err := http.NewRequestWithContext(r.Context(), http.MethodDelete, shardURL, nil)
+			if err != nil {
+				return
+			}
+			if internalSecret != "" {
+				req.Header.Set("X-Internal-Secret", internalSecret)
+			}
+			if reqID, ok := r.Context().Value("request_id").(string); ok && reqID != "" {
+				req.Header.Set("X-Request-ID", reqID)
+			}
+
+			resp, err := shardClient.Do(req)
+			if err != nil {
+				mu.Lock()
+				lastErr = err
+				mu.Unlock()
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode < 300 {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(targetAddr)
 	}
 
-	resp, err := shardClient.Do(req)
-	if err != nil {
-		http.Error(w, "shard request failed: "+err.Error(), http.StatusBadGateway)
+	wg.Wait()
+
+	if successCount == 0 {
+		http.Error(w, "delete failed on all replicas: "+fmt.Sprint(lastErr), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
 
+	invalidateCache(r.Context())
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"deleted","replicas":` + strconv.Itoa(successCount) + `,"id":"` + docID + `"}`))
 
-	if resp.StatusCode < 300 {
-		invalidateCache(r.Context())
-	}
-	log.Printf("document %q delete routed to shard %s", docID, targetAddr)
+	log.Printf("document %q delete replicated across %d shards", docID, successCount)
 }
 
 // getDocHandler routes a document retrieval to the correct shard via hash ring.
@@ -641,6 +779,9 @@ func getDocHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if internalSecret != "" {
 		req.Header.Set("X-Internal-Secret", internalSecret)
+	}
+	if reqID, ok := r.Context().Value("request_id").(string); ok && reqID != "" {
+		req.Header.Set("X-Request-ID", reqID)
 	}
 
 	resp, err := shardClient.Do(req)
@@ -700,12 +841,14 @@ func bulkIndexHandler(w http.ResponseWriter, r *http.Request) {
 		if doc.ID == "" {
 			continue
 		}
-		targetAddr := hashRing.GetShard(doc.ID)
-		if targetAddr == "" {
+		targetAddrs := hashRing.GetShards(doc.ID, 3)
+		if len(targetAddrs) == 0 {
 			continue
 		}
 		data, _ := json.Marshal(doc)
-		shardBatches[targetAddr] = append(shardBatches[targetAddr], data)
+		for _, t := range targetAddrs {
+			shardBatches[t] = append(shardBatches[t], data)
+		}
 	}
 
 	type shardBulkResult struct {
@@ -741,6 +884,9 @@ func bulkIndexHandler(w http.ResponseWriter, r *http.Request) {
 			req.Header.Set("Content-Type", "application/json")
 			if internalSecret != "" {
 				req.Header.Set("X-Internal-Secret", internalSecret)
+			}
+			if reqID, ok := r.Context().Value("request_id").(string); ok && reqID != "" {
+				req.Header.Set("X-Request-ID", reqID)
 			}
 
 			resp, err := shardClient.Do(req)

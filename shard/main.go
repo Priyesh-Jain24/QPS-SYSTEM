@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/blevesearch/bleve/v2"
-	"github.com/blevesearch/bleve/v2/search/highlight/highlighter/ansi"
 	"github.com/blevesearch/bleve/v2/search/query"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -189,7 +188,7 @@ func searchHandler(w http.ResponseWriter, r *http.Request) {
 	// Enable highlighting if requested.
 	highlight := r.URL.Query().Get("highlight") == "true"
 	if highlight {
-		searchReq.Highlight = bleve.NewHighlightWithStyle(ansi.Name)
+		searchReq.Highlight = bleve.NewHighlightWithStyle("html")
 	}
 
 	res, err := index.Search(searchReq)
@@ -296,8 +295,13 @@ func logRequest(next http.HandlerFunc) http.HandlerFunc {
 
 		next(sw, r)
 
-		log.Printf("[%s] HTTP %s %s | %d | %dms",
-			shardID, r.Method, r.URL.Path, sw.code,
+		reqID := r.Header.Get("X-Request-ID")
+		if reqID == "" {
+			reqID = "unknown"
+		}
+
+		log.Printf(`{"level":"info","request_id":"%s","shard_id":"%s","method":"%s","path":"%s","status":%d,"latency_ms":%d}`,
+			reqID, shardID, r.Method, r.URL.Path, sw.code,
 			time.Since(start).Milliseconds(),
 		)
 	}
@@ -400,6 +404,16 @@ func main() {
 		log.Fatalf("[%s] failed to build/open index: %v", shardID, err)
 	}
 	index = idx
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := saveEmbeddings(embeddingsPath); err != nil {
+				log.Printf("[%s] failed to save embeddings periodically: %v", shardID, err)
+			}
+		}
+	}()
 
 	http.HandleFunc("/search", wrapShardMiddleware(searchHandler))
 	http.HandleFunc("/health", wrapShardMiddleware(healthHandler))

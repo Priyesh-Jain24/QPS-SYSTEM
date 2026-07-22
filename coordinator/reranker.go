@@ -7,7 +7,6 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"os"
 	"sort"
 	"strconv"
 	"time"
@@ -82,15 +81,9 @@ func Rerank(query string, results []MergedResult) []MergedResult {
 	}
 
 	// 1. Parse hybrid weight config
-	weightStr := os.Getenv("HYBRID_WEIGHT")
-	if weightStr == "" {
-		weightStr = "0.7" // 70% Semantic, 30% Keyword
-	}
-	semanticWeight, err := strconv.ParseFloat(weightStr, 64)
-	if err != nil || semanticWeight < 0 || semanticWeight > 1 {
-		semanticWeight = 0.7
-	}
-	keywordWeight := 1.0 - semanticWeight
+	semanticWeight := 0.5
+	keywordWeight := 0.3
+	popularityWeight := 0.2
 
 	// 2. Get query embedding
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -102,14 +95,22 @@ func Rerank(query string, results []MergedResult) []MergedResult {
 		return results
 	}
 
-	// 3. Compute cosine similarity synchronously (no network I/O needed anymore!)
+	// 3. Compute hybrid scores
 	for i := range results {
 		sim := cosineSimilarity(qEmb, results[i].Embedding)
 
-		// Map bleve score to a smaller scale so semantic sim dominates if configured
+		// BM25 is unbounded (often 0-15+), scale it down
 		mappedBleveScore := results[i].Score * 0.1
 
-		results[i].Score = (mappedBleveScore * keywordWeight) + (sim * semanticWeight)
+		// Popularity/Clicks from Metadata (if it exists)
+		popScore := 0.0
+		if popStr, found := results[i].Metadata["popularity"]; found {
+			if p, err := strconv.ParseFloat(popStr, 64); err == nil && p > 0 {
+				popScore = math.Log1p(p) * 0.1 // Normalized log scale
+			}
+		}
+
+		results[i].Score = (mappedBleveScore * keywordWeight) + (sim * semanticWeight) + (popScore * popularityWeight)
 	}
 
 	sort.Slice(results, func(i, j int) bool {

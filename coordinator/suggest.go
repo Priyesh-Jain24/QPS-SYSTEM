@@ -10,6 +10,41 @@ import (
 	"time"
 )
 
+// levenshtein calculates the edit distance between two strings
+func levenshtein(s, t string) int {
+	if len(s) == 0 {
+		return len(t)
+	}
+	if len(t) == 0 {
+		return len(s)
+	}
+	d := make([][]int, len(s)+1)
+	for i := range d {
+		d[i] = make([]int, len(t)+1)
+		d[i][0] = i
+	}
+	for j := 0; j <= len(t); j++ {
+		d[0][j] = j
+	}
+	for j := 1; j <= len(t); j++ {
+		for i := 1; i <= len(s); i++ {
+			if s[i-1] == t[j-1] {
+				d[i][j] = d[i-1][j-1]
+			} else {
+				min := d[i-1][j] + 1
+				if d[i][j-1]+1 < min {
+					min = d[i][j-1] + 1
+				}
+				if d[i-1][j-1]+1 < min {
+					min = d[i-1][j-1] + 1
+				}
+				d[i][j] = min
+			}
+		}
+	}
+	return d[len(s)][len(t)]
+}
+
 // trackQuery records a search query for analytics:
 // 1. Increments its score in the "searchsphere:popular" sorted set (frequency ranking).
 // 2. Pushes it onto the "searchsphere:recent" list (capped at 100 entries).
@@ -81,8 +116,14 @@ func suggestHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	suggestions := make([]suggestion, 0, 10)
+	var bestFuzzyMatch string
+	var bestFuzzyScore float64
+	minDist := 3 // Max allowed typos
+
 	for _, m := range members {
 		q := m.Member.(string)
+
+		// 1. Exact prefix matching (autocomplete)
 		if strings.HasPrefix(q, prefix) && q != prefix {
 			suggestions = append(suggestions, suggestion{
 				Query: q,
@@ -91,7 +132,26 @@ func suggestHandler(w http.ResponseWriter, r *http.Request) {
 			if len(suggestions) >= 10 {
 				break
 			}
+		} else if len(suggestions) == 0 {
+			// 2. Spelling correction fallback if no prefix
+			// Only attempt if lengths are somewhat similar
+			if len(q) >= len(prefix)-2 && len(q) <= len(prefix)+2 {
+				dist := levenshtein(prefix, q)
+				if dist < minDist {
+					minDist = dist
+					bestFuzzyMatch = q
+					bestFuzzyScore = m.Score
+				}
+			}
 		}
+	}
+
+	// If we got no autocomplete matches but found a typo fix, suggest it
+	if len(suggestions) == 0 && bestFuzzyMatch != "" {
+		suggestions = append(suggestions, suggestion{
+			Query: bestFuzzyMatch,
+			Score: bestFuzzyScore,
+		})
 	}
 
 	writeJSON(w, map[string]interface{}{

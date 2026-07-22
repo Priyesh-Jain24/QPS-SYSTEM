@@ -1,8 +1,8 @@
 FROM golang:1.26-alpine AS build
 WORKDIR /app
-COPY go.mod go.sum ./
+COPY coordinator/go.mod coordinator/go.sum ./
 RUN go mod download
-COPY . .
+COPY coordinator/ .
 RUN CGO_ENABLED=0 GOOS=linux go build -o coordinator .
 
 FROM node:20-alpine AS frontend-build

@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"hash/fnv"
 	"io"
 	"log"
+	"math/bits"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,7 +19,64 @@ var (
 	shardStartTime time.Time
 	docsIngested   int64
 	docsDeleted    int64
+	seenSimHashes  sync.Map // uint64 -> docID
 )
+
+// simhash computes a 64-bit document fingerprint where similar texts map to similar hashes.
+func simhash(text string) uint64 {
+	words := strings.Fields(text)
+	var v [64]int
+	for _, word := range words {
+		if len(word) < 3 {
+			continue // skip stop-words for stability
+		}
+		h := fnv.New64a()
+		h.Write([]byte(strings.ToLower(word)))
+		hash := h.Sum64()
+		for i := 0; i < 64; i++ {
+			if ((hash >> i) & 1) == 1 {
+				v[i]++
+			} else {
+				v[i]--
+			}
+		}
+	}
+	var fingerprint uint64
+	for i := 0; i < 64; i++ {
+		if v[i] > 0 {
+			fingerprint |= (1 << i)
+		}
+	}
+	return fingerprint
+}
+
+// isDuplicate returns true if the content is a near-duplicate (>95% match) of an existing doc.
+func isDuplicate(id, content string) (bool, string) {
+	sh := simhash(content)
+	duplicate := false
+	dupID := ""
+
+	seenSimHashes.Range(func(key, value interface{}) bool {
+		knownHash := key.(uint64)
+		knownID := value.(string)
+		if knownID == id { // Allow upserts of self
+			seenSimHashes.Store(sh, id) // update hash just in case
+			return true
+		}
+		// Hamming distance <= 2 means out of 64 bits only 2 differ (near identical)
+		if bits.OnesCount64(sh^knownHash) <= 2 {
+			duplicate = true
+			dupID = knownID
+			return false
+		}
+		return true
+	})
+
+	if !duplicate {
+		seenSimHashes.Store(sh, id)
+	}
+	return duplicate, dupID
+}
 
 // IngestRequest is the payload accepted by POST /index.
 type IngestRequest struct {
@@ -88,31 +147,52 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc := Document{
-		ID:       req.ID,
-		Title:    req.Title,
-		Content:  req.Content,
-		Metadata: req.Metadata,
-	}
-
-	if err := index.Index(doc.ID, doc); err != nil {
-		http.Error(w, "indexing failed: "+err.Error(), http.StatusInternalServerError)
+	if dup, originalID := isDuplicate(req.ID, req.Content); dup {
+		log.Printf("[%s] rejected duplicate of %s (ID: %s)", shardID, originalID, req.ID)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(IngestResponse{
+			Status:  "skipped_duplicate",
+			ShardID: shardID,
+			DocID:   req.ID,
+		})
 		return
 	}
 
-	if emb, err := getEmbedding(doc.Title + " " + doc.Content); err == nil && len(emb) > 0 {
-		docEmbeddings.Store(doc.ID, emb)
+	chunks, _ := getDocumentChunks(req.ID, req.Title, req.Content)
+	for _, c := range chunks {
+		meta := make(map[string]string)
+		for k, v := range req.Metadata {
+			meta[k] = v
+		}
+		meta["parent_id"] = req.ID
+
+		doc := Document{
+			ID:       c.ID,
+			Title:    req.Title,
+			Content:  c.Text,
+			Metadata: meta,
+		}
+
+		if err := index.Index(doc.ID, doc); err != nil {
+			http.Error(w, "indexing failed: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		if len(c.Vector) > 0 {
+			docEmbeddings.Store(doc.ID, c.Vector)
+		}
 	}
 
 	atomic.AddInt64(&docsIngested, 1)
-	log.Printf("[%s] indexed document %q", shardID, doc.ID)
+	log.Printf("[%s] indexed document %q", shardID, req.ID)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(IngestResponse{
 		Status:  "indexed",
 		ShardID: shardID,
-		DocID:   doc.ID,
+		DocID:   req.ID,
 	})
 }
 
@@ -248,19 +328,37 @@ func bulkIngestHandler(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(d IngestRequest) {
 			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
 
-			doc := Document{ID: d.ID, Title: d.Title, Content: d.Content, Metadata: d.Metadata}
-			if err := index.Index(doc.ID, doc); err != nil {
+			if dup, _ := isDuplicate(d.ID, d.Content); dup {
 				mu.Lock()
-				errors = append(errors, "failed to index "+doc.ID+": "+err.Error())
+				// Silently skip duplicate instead of returning an error for bulk
+				indexed++
 				mu.Unlock()
 				return
 			}
 
-			if emb, err := getEmbedding(doc.Title + " " + doc.Content); err == nil && len(emb) > 0 {
-				docEmbeddings.Store(doc.ID, emb)
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			chunks, _ := getDocumentChunks(d.ID, d.Title, d.Content)
+			for _, c := range chunks {
+				meta := make(map[string]string)
+				for k, v := range d.Metadata {
+					meta[k] = v
+				}
+				meta["parent_id"] = d.ID
+
+				doc := Document{ID: c.ID, Title: d.Title, Content: c.Text, Metadata: meta}
+				if err := index.Index(doc.ID, doc); err != nil {
+					mu.Lock()
+					errors = append(errors, "failed to index "+doc.ID+": "+err.Error())
+					mu.Unlock()
+					continue // try next chunk
+				}
+
+				if len(c.Vector) > 0 {
+					docEmbeddings.Store(doc.ID, c.Vector)
+				}
 			}
 
 			atomic.AddInt64(&docsIngested, 1)

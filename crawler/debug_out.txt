@@ -1,8 +1,0 @@
-2026/07/19 22:11:15 Starting crawler with 3 workers, limit=5.
-2026/07/19 22:11:15 Searching Wikipedia for topic: 'Football'...
-2026/07/19 22:11:15 [W1] Crawling 1/5: https://en.wikipedia.org/wiki/Football
-2026/07/19 22:11:15 [W2] Crawling 2/5: https://en.wikipedia.org/wiki/College_football
-2026/07/19 22:11:15 [W3] Crawling 3/5: https://en.wikipedia.org/wiki/Football_at_the_Summer_Olympics
-2026/07/19 22:11:15 [W1] Crawling 4/5: https://en.wikipedia.org/wiki/The_Football_Association
-2026/07/19 22:11:15 [W2] Crawling 5/5: https://en.wikipedia.org/wiki/Football_hooliganism
-2026/07/19 22:11:15 Crawler finished gracefully.
